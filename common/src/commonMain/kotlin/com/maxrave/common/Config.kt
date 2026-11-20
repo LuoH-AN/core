@@ -264,11 +264,17 @@ object SUPPORTED_LANGUAGE {
  * is the same stream the quality setting three modules away is supposed to produce.
  */
 object ITAG {
+    /** Opus ~48 kbps, used when higher-bitrate renditions are unavailable. */
+    const val AUDIO_OPUS_LOWEST: Int = 249
+
     /** Opus, adaptive audio — what the "Low" audio-quality setting selects. */
     const val AUDIO_OPUS_LOW: Int = 250
 
     /** Opus, adaptive audio — what the "Medium" audio-quality setting selects. */
     const val AUDIO_OPUS_MEDIUM: Int = 251
+
+    /** AAC ~128 kbps. Some songs expose only this ordinary, non-Premium rendition. */
+    const val AUDIO_AAC_MEDIUM: Int = 140
 
     /** Opus 256 kbps, adaptive audio — the "High" setting. YouTube serves it to Premium accounts only. */
     const val AUDIO_OPUS_HIGH: Int = 774
@@ -292,7 +298,8 @@ object ITAG {
     const val MUXED_360P: Int = 18
 
     /** Every adaptive audio itag the app knows how to play. */
-    val AUDIO: Set<Int> = setOf(AUDIO_OPUS_LOW, AUDIO_OPUS_MEDIUM, AUDIO_OPUS_HIGH, AUDIO_AAC_HIGH)
+    val AUDIO: Set<Int> =
+        setOf(AUDIO_OPUS_LOWEST, AUDIO_OPUS_LOW, AUDIO_OPUS_MEDIUM, AUDIO_AAC_MEDIUM, AUDIO_OPUS_HIGH, AUDIO_AAC_HIGH)
 
     /** Every adaptive video itag the app knows how to play. */
     val VIDEO: Set<Int> = setOf(VIDEO_1080P, VIDEO_720P, VIDEO_360P)

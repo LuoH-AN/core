@@ -32,7 +32,15 @@ internal fun List<Pair<Int, String>>.playableStreams(
     videoId: String,
     tier: String,
 ): List<Pair<Int, String>> {
-    val audioPriority = listOf(ITAG.AUDIO_OPUS_MEDIUM, ITAG.AUDIO_OPUS_LOW, ITAG.AUDIO_OPUS_HIGH, ITAG.AUDIO_AAC_HIGH)
+    val audioPriority =
+        listOf(
+            ITAG.AUDIO_OPUS_MEDIUM,
+            ITAG.AUDIO_AAC_MEDIUM,
+            ITAG.AUDIO_OPUS_LOW,
+            ITAG.AUDIO_OPUS_HIGH,
+            ITAG.AUDIO_AAC_HIGH,
+            ITAG.AUDIO_OPUS_LOWEST,
+        )
     val candidates =
         filter { it.first in ITAG.AUDIO && it.second.isNotBlank() }
             .sortedBy { audioPriority.indexOf(it.first) }
@@ -72,8 +80,7 @@ internal fun List<Pair<Int, String>>.playableStreams(
         if (accepted) {
             if (!hadRejection) return this
             Logger.i("Extractor", "PipePipe[$tier] recovered audio for $videoId with itag=${candidate.first}")
-            val audioItags = ITAG.AUDIO + setOf(140, 249)
-            return filter { it.first !in audioItags || it.second == candidate.second }
+            return filter { it.first !in ITAG.AUDIO || it.second == candidate.second }
         }
         hadRejection = true
     }
