@@ -13,6 +13,7 @@ import com.maxrave.domain.data.entities.ArtistMotionEntity
 import com.maxrave.domain.data.entities.AutoEqCurveEntity
 import com.maxrave.domain.data.entities.AutoEqEntryEntity
 import com.maxrave.domain.data.entities.AutoEqIndexMetaEntity
+import com.maxrave.domain.data.entities.DeletedLyricsEntity
 import com.maxrave.domain.data.entities.EpisodeEntity
 import com.maxrave.domain.data.entities.FollowedArtistSingleAndAlbum
 import com.maxrave.domain.data.entities.GoogleAccountEntity
@@ -747,6 +748,22 @@ interface DatabaseDao {
     @Insert(onConflict = OnConflictStrategy.Companion.REPLACE)
     suspend fun insertLyrics(lyrics: LyricsEntity)
 
+    @Query("DELETE FROM lyrics WHERE videoId = :videoId")
+    suspend fun deleteLyrics(videoId: String)
+
+    @Query("DELETE FROM translated_lyrics WHERE videoId = :videoId")
+    suspend fun deleteTranslatedLyrics(videoId: String)
+
+    @Insert(onConflict = OnConflictStrategy.Companion.IGNORE)
+    suspend fun insertDeletedLyrics(deletedLyrics: DeletedLyricsEntity)
+
+    @Query("SELECT EXISTS(SELECT 1 FROM deleted_lyrics WHERE videoId = :videoId AND provider = :provider AND lyricsId = :lyricsId)")
+    suspend fun isLyricsDeleted(
+        videoId: String,
+        provider: String,
+        lyricsId: String,
+    ): Boolean
+
     @Query("SELECT * FROM lyrics WHERE videoId = :videoId")
     suspend fun getLyrics(videoId: String): LyricsEntity?
 
@@ -824,11 +841,12 @@ interface DatabaseDao {
     @Insert(onConflict = OnConflictStrategy.Companion.REPLACE)
     suspend fun insertPairSongLocalPlaylist(pairSongLocalPlaylist: PairSongLocalPlaylist)
 
-    @Query("SELECT * FROM pair_song_local_playlist WHERE songId = :videoId AND playlistId = :localPlaylistId LIMIT 1")
+    // Newest row: a song added while an older copy sits in the playlist must get its own row (#2933).
+    @Query("SELECT * FROM pair_song_local_playlist WHERE songId = :videoId AND playlistId = :localPlaylistId ORDER BY id DESC LIMIT 1")
     suspend fun getPlaylistPairOfSong(
         videoId: String,
         localPlaylistId: Long,
-    ): PairSongLocalPlaylist
+    ): PairSongLocalPlaylist?
 
     @Query("SELECT * FROM pair_song_local_playlist WHERE playlistId = :playlistId ORDER BY position ASC LIMIT :limit OFFSET :offset")
     suspend fun getPlaylistPairSong(
@@ -837,10 +855,11 @@ interface DatabaseDao {
         offset: Int,
     ): List<PairSongLocalPlaylist>
 
-    @Query("SELECT * FROM pair_song_local_playlist WHERE playlistId = :playlistId AND position in (:positionList)")
-    suspend fun getPlaylistPairSongByListPosition(
+    // Rows come back in table order, not in the order of [rowIds]: the repository restores it.
+    @Query("SELECT * FROM pair_song_local_playlist WHERE playlistId = :playlistId AND id IN (:rowIds)")
+    suspend fun getPlaylistPairSongByRowIds(
         playlistId: Long,
-        positionList: List<Int>,
+        rowIds: List<Int>,
     ): List<PairSongLocalPlaylist>
 
     /**
@@ -983,6 +1002,49 @@ interface DatabaseDao {
         playlistId: Long,
         offset: Int,
     ): List<PairSongLocalPlaylist>
+
+    @Query(
+        "DELETE FROM pair_song_local_playlist WHERE id = :pairId AND playlistId = :playlistId AND songId = :videoId",
+    )
+    suspend fun deletePairSongLocalPlaylistRow(
+        playlistId: Long,
+        videoId: String,
+        pairId: Int,
+    ): Int
+
+    @Query("SELECT COUNT(*) FROM pair_song_local_playlist WHERE playlistId = :playlistId AND songId = :videoId")
+    suspend fun countPairsOfSong(
+        playlistId: Long,
+        videoId: String,
+    ): Int
+
+    /**
+     * Removes exactly the row [pairId] of [videoId], the one the user picked, and keeps `tracks`
+     * holding no more copies of the song than rows are left: every copy once none is left, else one
+     * copy when `tracks` has more than the rows. Copies are matched by count, not by index: moves
+     * rewrite positions only and sync writes `tracks` without duplicates, so the n-th copy in
+     * `tracks` is not the n-th row (#2933).
+     *
+     * @return null when the row no longer exists, else whether it was the song's last copy.
+     */
+    @Transaction
+    suspend fun removePairSongFromLocalPlaylist(
+        playlistId: Long,
+        videoId: String,
+        pairId: Int,
+    ): Boolean? {
+        if (deletePairSongLocalPlaylistRow(playlistId, videoId, pairId) == 0) return null
+        val left = countPairsOfSong(playlistId, videoId)
+        val tracks = getLocalPlaylist(playlistId)?.tracks ?: return left == 0
+        val next =
+            when {
+                left == 0 -> tracks.filterNot { it == videoId }
+                tracks.count { it == videoId } > left -> tracks.toMutableList().apply { removeAt(lastIndexOf(videoId)) }
+                else -> tracks
+            }
+        if (next != tracks) updateLocalPlaylistTracks(next, playlistId)
+        return left == 0
+    }
 
     @Query(
         "DELETE FROM pair_song_local_playlist WHERE songId = :videoId AND playlistId = :playlistId",

@@ -17,6 +17,7 @@ import com.maxrave.domain.data.player.PlayerConstants
 import com.maxrave.domain.data.player.PlayerError
 import com.maxrave.domain.extension.isVideo
 import com.maxrave.domain.manager.DataStoreManager
+import com.maxrave.domain.mediaservice.player.BassEnvelope
 import com.maxrave.domain.mediaservice.player.MediaPlayerInterface
 import com.maxrave.domain.mediaservice.player.MediaPlayerListener
 import com.maxrave.domain.repository.StreamRepository
@@ -56,6 +57,7 @@ import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.roundToInt
 import kotlin.random.Random
+import kotlin.time.TimeSource
 
 private const val TAG = "MpvPlayerAdapter"
 
@@ -1385,6 +1387,33 @@ class MpvPlayerAdapter(
         return MpvWaveformReader.read(mediaId, onProgress) { waveformSourceUrl(mediaId) }
     }
 
+    // The lyrics background asks every frame, so the answer comes from memory and a missing envelope is
+    // loaded in the background: from disk, or by the waveform's own decode of the track.
+    private val bassEnvelopes = ConcurrentHashMap<String, BassEnvelope>()
+    private val bassAttempts = ConcurrentHashMap<String, Long>()
+
+    override fun bassPulse(
+        mediaId: String,
+        positionMs: Long,
+    ): Float {
+        if (mediaId.isBlank() || LiveStreamRegistry.isLive(mediaId)) return 0f
+        bassEnvelopes[mediaId]?.let { return it.pulseAt(positionMs) }
+        val now = System.currentTimeMillis()
+        val last = bassAttempts[mediaId]
+        // One load at a time per track, and a failed one (no URL yet, a slice without the filters) waits
+        // a little before the next frame starts another.
+        if (last == null || now - last >= BASS_RETRY_MS) {
+            bassAttempts[mediaId] = now
+            coroutineScope.launch(Dispatchers.IO) {
+                val bass = runCatching { MpvWaveformReader.bass(mediaId) { waveformSourceUrl(mediaId) } }.getOrNull() ?: return@launch
+                // Only the tracks around the current one are worth holding.
+                if (bassEnvelopes.size >= MAX_BASS_ENVELOPES) bassEnvelopes.clear()
+                bassEnvelopes[mediaId] = bass
+            }
+        }
+        return 0f
+    }
+
     /**
      * The track's audio alone, found the way [extractPlayableUrl] finds it: a download first, then the
      * format's own audio URL. No fallback extraction: a waveform is not worth another extraction.
@@ -2401,10 +2430,17 @@ class MpvPlayerAdapter(
         var lastOutgoingPitch = -1f
 
         try {
+            // Each step waits for its own mark from the fade's start, not a fixed delay after the previous
+            // step's work, so the time spent retuning the players never adds up and the fade ends at
+            // effectiveDurationMs, where the plan lands the incoming drop. Waiting a full step after every
+            // step (the last one included) ran a 22.4 s fade about 1.4 s long.
+            val fadeStart = TimeSource.Monotonic.markNow()
             for (step in 0..steps) {
                 currentCoroutineContext().ensureActive()
+                val wait = effectiveDurationMs.toLong() * step / steps - fadeStart.elapsedNow().inWholeMilliseconds
+                if (wait > 0) delay(wait)
 
-                val progress = step.toFloat() / steps
+                val progress = (fadeStart.elapsedNow().inWholeMilliseconds.toFloat() / effectiveDurationMs).coerceIn(0f, 1f)
                 val angle = progress * Math.PI / 2.0
 
                 val fadeOutVolume = (targetVolume * kotlin.math.cos(angle)).toInt()
@@ -2457,8 +2493,6 @@ class MpvPlayerAdapter(
                         lastOutgoingPitch = qOutPitch
                     }
                 }
-
-                delay(delayPerStep.toLong())
             }
 
             finalizeCrossfade(nextIndex, nextPlayer)
@@ -2623,12 +2657,20 @@ class MpvPlayerAdapter(
         return 30000.0 - (clampedBpm - 70) * 230.0
     }
 
+    /**
+     * The BPM a fade's length is worked out from: Tidal's, else the one measured from the waveform. The
+     * measured one sets only the length (7 of 177 tracks measured off by far more than a rounding), never the
+     * tempo match, which stays on Tidal's alone in [calculateBpmSpeedRatio].
+     */
+    private fun bpmForFadeLength(videoId: String): Int? =
+        audioMetaCache[videoId]?.bpm ?: trackStructures[videoId]?.bpm?.roundToInt()
+
     private fun resolveAutoCrossfadeDurationMs(
         currentVideoId: String,
         nextVideoId: String,
     ): Int {
-        val currentBpm = audioMetaCache[currentVideoId]?.bpm
-        val nextBpm = audioMetaCache[nextVideoId]?.bpm
+        val currentBpm = bpmForFadeLength(currentVideoId)
+        val nextBpm = bpmForFadeLength(nextVideoId)
         if (currentBpm == null || nextBpm == null) return AUTO_FALLBACK_DURATION_MS
         if (currentBpm <= 0 || nextBpm <= 0) return AUTO_FALLBACK_DURATION_MS
 
@@ -2739,10 +2781,10 @@ class MpvPlayerAdapter(
         /** Floor for the shortest track worth crossfading, in ms. */
         private const val MIN_CROSSFADE_TRACK_MS = 20_000L
 
-        private const val AUTO_FALLBACK_DURATION_MS = 30000
+        private const val AUTO_FALLBACK_DURATION_MS = 24000
         private const val STRUCTURE_RETRY_MS = 30_000L
         private const val STRUCTURE_MAX_ATTEMPTS = 3
-        private const val AUTO_MIN_DURATION_MS = 20000
+        private const val AUTO_MIN_DURATION_MS = 15000
         private const val AUTO_MAX_DURATION_MS = 45000
         private val BEAT_COUNT_OPTIONS = intArrayOf(8, 16, 24, 32, 40, 48, 64, 80, 96)
         private const val DEFAULT_BEAT_COUNT = 32
@@ -3473,6 +3515,11 @@ class MpvPlayerAdapter(
 }
 
 private const val MPV_AUTO_DEVICE = "auto"
+
+// The lyrics background's bass: how long a failed load waits (a failed decode re-runs the whole
+// track), and how many tracks stay in memory.
+private const val BASS_RETRY_MS = 30_000L
+private const val MAX_BASS_ENVELOPES = 8
 
 /**
  * The outputs [driver] can route to, read off mpv's `audio-device-list`, with [activeDevice] marked.

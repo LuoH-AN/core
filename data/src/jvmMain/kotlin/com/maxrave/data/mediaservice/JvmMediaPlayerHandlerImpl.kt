@@ -70,6 +70,7 @@ import com.maxrave.domain.repository.SongRepository
 import com.maxrave.domain.repository.StreamRepository
 import com.maxrave.domain.utils.FilterState
 import com.maxrave.domain.utils.MusicVideoType
+import com.maxrave.domain.utils.REPLAY_MIX_PLAYLIST_ID
 import com.maxrave.domain.utils.Resource
 import com.maxrave.domain.utils.connectArtists
 import com.maxrave.domain.utils.isEndlessQueueId
@@ -904,6 +905,10 @@ class JvmMediaPlayerHandlerImpl(
             }
     }
 
+    /** The queue id the watch-time reports carry: none for the local Replay Mix, a made-up id. */
+    private val reportedPlaylistId: String?
+        get() = queueData.value.data.playlistId?.takeUnless { it == REPLAY_MIX_PLAYLIST_ID }
+
     private fun initPlayback(
         playback: String?,
         atr: String?,
@@ -915,7 +920,7 @@ class JvmMediaPlayerHandlerImpl(
             if (playback != null && atr != null && watchTime != null && cpn != null) {
                 watchTimeList = arrayListOf()
                 streamRepository
-                    .initPlayback(playback, atr, watchTime, cpn, queueData.value.data.playlistId)
+                    .initPlayback(playback, atr, watchTime, cpn, reportedPlaylistId)
                     .collect {
                         if (it.first == 204) {
                             Logger.d("Check initPlayback", "Success")
@@ -950,7 +955,7 @@ class JvmMediaPlayerHandlerImpl(
                                                     watchTimeUrl,
                                                     watchTimeList,
                                                     cpn,
-                                                    queueData.value.data.playlistId,
+                                                    reportedPlaylistId,
                                                 ).collect { response ->
                                                     if (response == 204) {
                                                         Logger.d("Check updateWatchTime", "Success")
@@ -964,7 +969,7 @@ class JvmMediaPlayerHandlerImpl(
                                                 .updateWatchTimeFull(
                                                     watchTimeUrl,
                                                     cpn,
-                                                    queueData.value.data.playlistId,
+                                                    reportedPlaylistId,
                                                 ).collect { response ->
                                                     if (response == 204) {
                                                         Logger.d("Check updateWatchTimeFull", "Success")
@@ -1516,7 +1521,7 @@ class JvmMediaPlayerHandlerImpl(
         }
     }
 
-    override fun shufflePlaylist(randomTrackIndex: Int) {
+    override fun shufflePlaylist(firstRowId: Int) {
         val playlistId = _queueData.value.data.playlistId ?: return
         val firstPlayedTrack = _queueData.value.data.firstPlayedTrack ?: return
         coroutineScope.launch {
@@ -1530,27 +1535,26 @@ class JvmMediaPlayerHandlerImpl(
                 }
                 addMediaItem(firstPlayedTrack.toGenericMediaItem(), playWhenReady = true)
                 val longId = playlistId.replace(LOCAL_PLAYLIST_ID, "").toLong()
-                val localPlaylist = localPlaylistRepository.getLocalPlaylist(longId).lastOrNull()?.data
-                if (localPlaylist != null) {
-                    Logger.w(TAG, "shufflePlaylist: Local playlist track size ${localPlaylist.tracks?.size}")
-                    val trackCount = localPlaylist.tracks?.size ?: return@launch
-                    val listPosition =
-                        (0 until trackCount).toMutableList().apply {
-                            remove(randomTrackIndex)
-                        }
-                    if (listPosition.isEmpty()) return@launch
-                    listPosition.shuffle()
-                    _queueData.update {
-                        it.copy(
-                            // After shuffle prefix is offset and list position
-                            data =
-                                it.data.copy(
-                                    continuation = "SHUFFLE0_${fromListIntToString(listPosition)}",
-                                ),
-                        )
+                // The playlist's real rows, one per copy of a song, minus the one already playing.
+                // Not positions: they keep a gap after a removal and stop matching `tracks` after a
+                // move, so a list of positions left songs out or played the first one twice.
+                val rowIds =
+                    localPlaylistRepository.getPlaylistRows(longId).map { it.id }.toMutableList().apply {
+                        remove(firstRowId)
                     }
-                    loadMore()
+                Logger.d(TAG, "shufflePlaylist: ${rowIds.size} rows left to shuffle")
+                if (rowIds.isEmpty()) return@launch
+                rowIds.shuffle()
+                _queueData.update {
+                    it.copy(
+                        // After the prefix: the batch offset, then the shuffled row ids
+                        data =
+                            it.data.copy(
+                                continuation = "SHUFFLE0_${fromListIntToString(rowIds)}",
+                            ),
+                    )
                 }
+                loadMore()
             }
         }
     }
@@ -1583,12 +1587,12 @@ class JvmMediaPlayerHandlerImpl(
                         val regex = Regex("(?<=SHUFFLE)\\d+(?=_)")
                         var offset = regex.find(continuation)?.value?.toInt() ?: return@launch
                         val posString = continuation.removePrefix("SHUFFLE${offset}_")
-                        val listPosition = fromStringToListInt(posString) ?: return@launch
-                        val theLastLoad = 50 * (offset + 1) >= listPosition.size
+                        val rowIds = fromStringToListInt(posString) ?: return@launch
+                        val theLastLoad = 50 * (offset + 1) >= rowIds.size
                         localPlaylistRepository
-                            .getPlaylistPairSongByListPosition(
+                            .getPlaylistPairSongByRowIds(
                                 longId,
-                                listPosition.subList(50 * offset, if (theLastLoad) listPosition.size else 50 * (offset + 1)),
+                                rowIds.subList(50 * offset, if (theLastLoad) rowIds.size else 50 * (offset + 1)),
                             ).singleOrNull()
                             ?.let { pair ->
                                 Logger.w("Check loadMore response", pair.size.toString())
@@ -1804,7 +1808,9 @@ class JvmMediaPlayerHandlerImpl(
                         }
                 }
             }
-        } else if (runBlocking { dataStoreManager.endlessQueue.first() } == TRUE) {
+        } else if (playlistId == REPLAY_MIX_PLAYLIST_ID || runBlocking { dataStoreManager.endlessQueue.first() } == TRUE) {
+            // Replay Mix is a radio: once its list runs out it goes on with the radio of its last
+            // track, whether or not Endless queue is on.
             Logger.w(TAG, "loadMore: Endless Queue")
             val lastTrack =
                 queueData.value.data.listTracks
@@ -2485,6 +2491,31 @@ class JvmMediaPlayerHandlerImpl(
 
     override fun getProgress(): Long = player.currentPosition
 
+    /**
+     * The queue in the playlist's own order, for saving. With shuffle on, listTracks follows the
+     * shuffled order (reorderShuffledQueue), and saving it that way froze one shuffle: the next launch
+     * restored the queue with shuffle off (shuffle is only remembered with Save playback state on) and
+     * played that shuffle again, in the same order every day (#2814). Kept as it is whenever a track
+     * is not the one the player holds at its unshuffled position: right after shuffle is toggled or a
+     * row is moved, listTracks and the player's order are briefly out of step.
+     */
+    private fun inPlaylistOrder(tracks: List<Track>): List<Track> {
+        if (!player.shuffleModeEnabled || tracks.size != player.mediaItemCount) return tracks
+        val original = arrayOfNulls<Track>(tracks.size)
+        try {
+            tracks.forEachIndexed { shuffled, track ->
+                val index = player.getUnshuffledIndex(shuffled)
+                if (index !in original.indices || original[index] != null) return tracks
+                if (player.getMediaItemAt(index)?.mediaId != track.videoId) return tracks
+                original[index] = track
+            }
+        } catch (e: IndexOutOfBoundsException) {
+            // Desktop reads the player's lists from another thread; one changing mid-read is "out of step" too.
+            return tracks
+        }
+        return original.filterNotNull()
+    }
+
     override fun mayBeSaveRecentSong(runBlocking: Boolean) {
         val unit =
             suspend {
@@ -2508,7 +2539,7 @@ class JvmMediaPlayerHandlerImpl(
                     )
                     val temp: ArrayList<Track> = ArrayList()
                     temp.clear()
-                    temp.addAll(_queueData.value.data.listTracks)
+                    temp.addAll(inPlaylistOrder(_queueData.value.data.listTracks))
                     Logger.i("Check recover queue", "Saved ${temp.size} tracks for the next launch")
                     songRepository.recoverQueue(temp)
                 }

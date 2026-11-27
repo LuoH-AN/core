@@ -11,6 +11,7 @@ import com.maxrave.domain.data.entities.ArtistMotionEntity
 import com.maxrave.domain.data.entities.AutoEqCurveEntity
 import com.maxrave.domain.data.entities.AutoEqEntryEntity
 import com.maxrave.domain.data.entities.AutoEqIndexMetaEntity
+import com.maxrave.domain.data.entities.DeletedLyricsEntity
 import com.maxrave.domain.data.entities.EpisodeEntity
 import com.maxrave.domain.data.entities.FollowedArtistSingleAndAlbum
 import com.maxrave.domain.data.entities.GoogleAccountEntity
@@ -521,6 +522,18 @@ internal class LocalDataSource(
 
     suspend fun insertLyrics(lyrics: LyricsEntity) = databaseDao.insertLyrics(lyrics)
 
+    suspend fun deleteLyrics(videoId: String) = databaseDao.deleteLyrics(videoId)
+
+    suspend fun deleteTranslatedLyrics(videoId: String) = databaseDao.deleteTranslatedLyrics(videoId)
+
+    suspend fun insertDeletedLyrics(deletedLyrics: DeletedLyricsEntity) = databaseDao.insertDeletedLyrics(deletedLyrics)
+
+    suspend fun isLyricsDeleted(
+        videoId: String,
+        provider: String,
+        lyricsId: String,
+    ) = databaseDao.isLyricsDeleted(videoId, provider, lyricsId)
+
     suspend fun getPreparingSongs(
         limit: Int,
         offset: Int,
@@ -590,10 +603,10 @@ internal class LocalDataSource(
         offset,
     )
 
-    suspend fun getPlaylistPairSongByListPosition(
+    suspend fun getPlaylistPairSongByRowIds(
         playlistId: Long,
-        listPosition: List<Int>,
-    ) = databaseDao.getPlaylistPairSongByListPosition(playlistId, listPosition)
+        rowIds: List<Int>,
+    ) = databaseDao.getPlaylistPairSongByRowIds(playlistId, rowIds)
 
     /**
      * Search one local playlist by title or artist.
@@ -694,6 +707,27 @@ internal class LocalDataSource(
     ) {
         databaseDao.deletePairSongLocalPlaylist(playlistId, videoId)
         syncRecorder.playlistTrack(playlistId, videoId, inPlaylist = false)
+    }
+
+    /**
+     * Removes exactly the row [pairId]. Library sync tracks a song as in the playlist or not, so it
+     * hears the song left only once its last copy is gone; dropping one of several copies only
+     * moves the order.
+     *
+     * @return false when the row no longer exists.
+     */
+    suspend fun removePairSongFromLocalPlaylist(
+        playlistId: Long,
+        videoId: String,
+        pairId: Int,
+    ): Boolean {
+        val lastCopy = databaseDao.removePairSongFromLocalPlaylist(playlistId, videoId, pairId) ?: return false
+        if (lastCopy) {
+            syncRecorder.playlistTrack(playlistId, videoId, inPlaylist = false)
+        } else {
+            syncRecorder.playlistOrder(playlistId)
+        }
+        return true
     }
 
     suspend fun getGoogleAccounts() = databaseDao.getAllGoogleAccount()
